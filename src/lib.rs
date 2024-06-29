@@ -37,24 +37,21 @@ enum UOps {
     ENDIF,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 struct UOp {
     op: UOps,
     dtype: Option<String>,
     src: Vec<UOp>,
-    arg: Option<Value>,
+    arg: Option<u32>,
 }
 
 impl UOp {
-    fn const_<T>(x: T) -> UOp
-    where
-        T: num::Num + serde::Serialize,
-    {
+    fn const_(x: u32) -> UOp {
         return UOp {
             op: UOps::CONST,
             dtype: Some("dtypes.int".to_string()),
             src: vec![],
-            arg: Some(serde_json::json!(x)),
+            arg: Some(x),
         };
     }
 }
@@ -63,20 +60,6 @@ impl UOp {
 pub struct ByteArray {
     ptr: *mut c_char,
     len: usize,
-}
-
-impl Language for UOp {
-    fn matches(&self, other: &Self) -> bool {
-        todo!()
-    }
-
-    fn children(&self) -> &[Id] {
-        todo!()
-    }
-
-    fn children_mut(&mut self) -> &mut [Id] {
-        todo!()
-    }
 }
 
 #[no_mangle]
@@ -91,14 +74,14 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
                 op: UOps::ALU,
                 dtype: Some("dtypes.int".to_string()),
                 src: vec![zero, val],
-                arg: Some(serde_json::json!("BinaryOps.ADD")),
+                arg: Some(1), // this is "BinaryOps.ADD"
             };
             println!("{:?}", x);
             let new = UOp {
                 op: UOps::CONST,
                 dtype: Some("dtypes.int".to_string()),
                 src: vec![],
-                arg: Some(serde_json::json!(42)),
+                arg: Some(42),
             };
             let ret = serde_pickle::to_vec(&new, serde_pickle::SerOptions::new()).unwrap();
             let len = ret.len();
