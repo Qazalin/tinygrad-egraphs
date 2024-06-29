@@ -52,7 +52,7 @@ enum BufferOps {
 }
 
 // *** uops
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 #[allow(non_camel_case_types)]
 enum UOps {
     SINK,
@@ -83,7 +83,7 @@ enum UOps {
     ENDRANGE,
     ENDIF,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 struct UOp {
     op: UOps,
     dtype: Option<String>,
@@ -114,14 +114,6 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
     let uop = pickle::from_slice::<UOp>(bytes, serde_pickle::DeOptions::new());
     match uop {
         Ok(_) => {
-            let zero = UOp::const_(0);
-            let val = UOp::const_(42);
-            let x = UOp {
-                op: UOps::ALU,
-                dtype: Some("dtypes.int".to_string()),
-                src: vec![zero, val],
-                arg: Some(1), // this is "BinaryOps.ADD"
-            };
             let new = UOp {
                 op: UOps::CONST,
                 dtype: Some("dtypes.int".to_string()),
@@ -140,5 +132,16 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
                     .unwrap();
             panic!("couldn't handle {:?}\n error = {:?}", value, err);
         }
+    }
+}
+
+#[cfg(test)]
+mod test_tiny {
+    use super::*;
+    #[test]
+    fn test_uop_eq() {
+        let u0 = UOp::const_(0);
+        let u1 = UOp::const_(0);
+        assert_eq!(u0, u1)
     }
 }
