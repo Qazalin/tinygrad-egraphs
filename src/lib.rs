@@ -1,10 +1,57 @@
+#[allow(unused)]
 use egg::{rewrite as rw, *};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use serde_pickle as pickle;
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::slice;
 
+// *** ops
+#[derive(Debug)]
+enum UnaryOps {
+    /// A -> A (elementwise)
+    EXP2,
+    LOG2,
+    CAST,
+    BITCAST,
+    SIN,
+    SQRT,
+    NEG,
+    RECIP,
+}
+#[derive(Debug)]
+enum BinaryOps {
+    /// A + A -> A (elementwise)
+    ADD,
+    MUL,
+    IDIV,
+    MAX,
+    MOD,
+    CMPLT,
+    CMPNE,
+    XOR,
+    SHR,
+    SHL,
+}
+#[derive(Debug)]
+enum TernaryOps {
+    /// A + A + A -> A (elementwise)
+    WHERE,
+    MULACC,
+}
+#[derive(Debug)]
+enum ReduceOps {
+    /// A -> B (reduce)
+    SUM,
+    MAX,
+}
+#[derive(Debug)]
+enum BufferOps {
+    LOAD,
+    CONST,
+    STORE,
+}
+
+// *** uops
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[allow(non_camel_case_types)]
 enum UOps {
@@ -36,7 +83,6 @@ enum UOps {
     ENDRANGE,
     ENDIF,
 }
-
 #[derive(Serialize, Deserialize, Debug)]
 struct UOp {
     op: UOps,
@@ -44,7 +90,6 @@ struct UOp {
     src: Vec<UOp>,
     arg: Option<u32>,
 }
-
 impl UOp {
     fn const_(x: u32) -> UOp {
         return UOp {
@@ -56,6 +101,7 @@ impl UOp {
     }
 }
 
+// *** api
 #[repr(C)]
 pub struct ByteArray {
     ptr: *mut c_char,
@@ -76,7 +122,6 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
                 src: vec![zero, val],
                 arg: Some(1), // this is "BinaryOps.ADD"
             };
-            println!("{:?}", x);
             let new = UOp {
                 op: UOps::CONST,
                 dtype: Some("dtypes.int".to_string()),
