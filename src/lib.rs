@@ -89,15 +89,8 @@ struct UOp {
     src: Vec<UOp>,
     arg: Option<String>,
 }
+
 impl UOp {
-    fn const_<T: ToString>(dtype: T, x: u32) -> UOp {
-        return UOp {
-            op: UOps::CONST,
-            dtype: Some(dtype.to_string()),
-            src: vec![],
-            arg: Some(x.to_string()),
-        };
-    }
     fn alu<T: Into<u32>, D: ToString>(op: T, src: Vec<UOp>) -> UOp {
         let op: u32 = op.into();
         return UOp {
@@ -109,15 +102,19 @@ impl UOp {
     }
 }
 
-/*
-class UPat:
-  op: Optional[Union[UOps, Set[UOps]]] = None
-  arg: Any = None
-  src: Optional[Union[Tuple[UPat, ...], List[UPat], UPat]] = None
-  name: Optional[str] = None
-  dtype: Optional[Union[DType, Set[DType]]] = None
-  allow_len: Set[int] = field(default_factory=set)
-*/
+impl<T> From<T> for UOp
+where
+    T: num::Num + ToString,
+{
+    fn from(value: T) -> Self {
+        UOp {
+            op: UOps::CONST,
+            dtype: Some("dtypes.int".into()),
+            src: vec![],
+            arg: Some(value.to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 struct UOpLang {
@@ -142,7 +139,7 @@ impl Display for UOpLang {
 
 impl Language for UOpLang {
     fn matches(&self, other: &Self) -> bool {
-        self == other
+        self.op == other.op && self.len() == other.len()
     }
 
     fn children(&self) -> &[Id] {
@@ -174,7 +171,19 @@ impl FromOp for UOpLang {
                 src: children,
                 arg: Some((BinaryOps::ADD as u32).to_string()),
             },
-            _ => todo!(),
+            "*" => Self {
+                op: UOps::ALU,
+                dtype: Some("dtypes.int".to_string()),
+                src: children,
+                arg: Some((BinaryOps::MUL as u32).to_string()),
+            },
+            "load" => Self {
+                op: UOps::LOAD,
+                dtype: Some("dtypes.int".to_string()),
+                src: children,
+                arg: None,
+            },
+            _ => todo!("{op}"),
         };
         Ok(expr)
     }
@@ -194,7 +203,7 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
     match uop {
         Ok(uop) => {
             println!("{:?}", uop);
-            let new = UOp::const_("dtypes.int".to_string(), 42);
+            let new: UOp = 42.into();
             let ret = serde_pickle::to_vec(&new, serde_pickle::SerOptions::new()).unwrap();
             let len = ret.len();
             let ptr = ret.as_ptr() as *mut c_char;
@@ -245,11 +254,11 @@ impl UOpEGraph {
         return self.egraph.add(expr);
     }
 
-    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> Vec<UOp> {
+    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> RecExpr<UOpLang> {
         let runner = Runner::default().with_egraph(self.egraph).run(pm);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best_expr) = extractor.find_best(self.sink);
-        panic!("{:?}", best_expr);
+        best_expr
     }
 }
 
@@ -267,8 +276,8 @@ mod test_tiny {
 
     #[test]
     fn test_uop_eq() {
-        let u0 = UOp::const_("dtypes.int", 0);
-        let u1 = UOp::const_("dtypes.int", 0);
+        let u0: UOp = 0.into();
+        let u1: UOp = 0.into();
         assert_eq!(u0, u1)
     }
 
@@ -277,14 +286,58 @@ mod test_tiny {
         let add = UOp {
             op: UOps::ALU,
             dtype: Some("dtypes.int".into()),
-            src: vec![UOp::const_("dtypes.int", 42), UOp::const_("dtypes.int", 0)],
+            src: vec![42.into(), 1.into()],
             arg: Some((BinaryOps::ADD as u32).to_string()),
         };
         let uegraph = UOpEGraph::new(&add);
-        /*
-        let pat: Pattern<UOpLang> = "(+ ?x 0)".parse().unwrap();
+        let pat: Pattern<UOpLang> = "(+ ?x 1)".parse().unwrap();
         let matches = pat.search(&uegraph.egraph);
         assert!(!matches.is_empty());
-        */
+    }
+
+    #[test]
+    fn test_symbol_lang_ref() {
+        let mut egraph: EGraph<SymbolLang, ()> = Default::default();
+        let a = egraph.add(SymbolLang::leaf("42"));
+        let b = egraph.add(SymbolLang::leaf("1"));
+        egraph.add(SymbolLang::new("*", vec![a, b]));
+        egraph.rebuild();
+        let pat: Pattern<SymbolLang> = "(* ?x 1)".parse().unwrap();
+        let matches = pat.search(&egraph);
+        assert!(!matches.is_empty());
+    }
+
+    #[test]
+    fn test_tiny_mul() {
+        let add = UOp {
+            op: UOps::ALU,
+            dtype: Some("dtypes.int".into()),
+            src: vec![42.into(), 1.into()],
+            arg: Some((BinaryOps::MUL as u32).to_string()),
+        };
+        let pm = &[
+            rw!("mul-1"; "(* ?x 1)" => "?x"),
+            rw!("mul-0"; "(* ?x 0)" => "0"),
+        ];
+        let uegraph = UOpEGraph::new(&add);
+        let sink = uegraph.graph_rewrite(pm);
+        panic!("{:?}", sink);
+    }
+
+    #[test]
+    fn test_symbol_lang_ref_mul() {
+        let mut egraph: EGraph<SymbolLang, ()> = Default::default();
+        let a = egraph.add(SymbolLang::leaf("42"));
+        let b = egraph.add(SymbolLang::leaf("1"));
+        let foo = egraph.add(SymbolLang::new("*", vec![a, b]));
+        egraph.rebuild();
+        let pm = &[
+            rw!("mul-1"; "(* ?x 1)" => "?x"),
+            rw!("mul-0"; "(* ?x 0)" => "0"),
+        ];
+        let runner = Runner::default().with_egraph(egraph).run(pm);
+        let extractor = Extractor::new(&runner.egraph, AstSize);
+        let (_, best_expr) = extractor.find_best(foo);
+        panic!("{:?}", best_expr);
     }
 }
