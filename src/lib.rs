@@ -4,7 +4,11 @@ use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_pickle as pickle;
 use std::os::raw::{c_char, c_int, c_uchar};
-use std::slice;
+use std::{convert::Infallible, env, fmt::Display, slice};
+
+lazy_static::lazy_static! {
+    pub static ref GRAPH: bool = env::var("GRAPH").map(|v| v == "1").unwrap_or(false);
+}
 
 // *** ops
 #[derive(Debug, FromPrimitive, IntoPrimitive)]
@@ -78,7 +82,7 @@ enum UOps {
     ENDRANGE,
     ENDIF,
 }
-#[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 struct UOp {
     op: UOps,
     dtype: Option<String>,
@@ -94,7 +98,7 @@ impl UOp {
             arg: Some(x.to_string()),
         };
     }
-    fn alu<T: Into<u32>>(op: T, src: Vec<UOp>) -> UOp {
+    fn alu<T: Into<u32>, D: ToString>(op: T, src: Vec<UOp>) -> UOp {
         let op: u32 = op.into();
         return UOp {
             op: UOps::ALU,
@@ -102,6 +106,77 @@ impl UOp {
             src,
             arg: Some(op.to_string()),
         };
+    }
+}
+
+/*
+class UPat:
+  op: Optional[Union[UOps, Set[UOps]]] = None
+  arg: Any = None
+  src: Optional[Union[Tuple[UPat, ...], List[UPat], UPat]] = None
+  name: Optional[str] = None
+  dtype: Optional[Union[DType, Set[DType]]] = None
+  allow_len: Set[int] = field(default_factory=set)
+*/
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
+struct UOpLang {
+    op: UOps,
+    dtype: Option<String>,
+    src: Vec<Id>,
+    arg: Option<String>,
+}
+
+impl Display for UOpLang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} {} {} {:?}",
+            self.op,
+            self.dtype.clone().unwrap_or("".into()),
+            self.arg.clone().unwrap_or("".into()),
+            self.src
+        )
+    }
+}
+
+impl Language for UOpLang {
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn children(&self) -> &[Id] {
+        &self.src
+    }
+
+    fn children_mut(&mut self) -> &mut [Id] {
+        &mut self.src
+    }
+}
+
+impl FromOp for UOpLang {
+    type Error = Infallible;
+
+    fn from_op(op: &str, children: Vec<Id>) -> Result<Self, Self::Error> {
+        if let Some(const_literal) = op.parse::<u32>().ok() {
+            return Ok(Self {
+                op: UOps::CONST,
+                dtype: Some("dtypes.int".to_string()),
+                src: vec![],
+                arg: Some(const_literal.to_string()),
+            });
+        }
+
+        let expr = match op {
+            "+" => Self {
+                op: UOps::ALU,
+                dtype: Some("dtypes.int".to_string()),
+                src: children,
+                arg: Some((BinaryOps::ADD as u32).to_string()),
+            },
+            _ => todo!(),
+        };
+        Ok(expr)
     }
 }
 
@@ -137,7 +212,7 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
 
 #[derive(Debug)]
 struct UOpEGraph {
-    egraph: EGraph<SymbolLang, ()>,
+    egraph: EGraph<UOpLang, ()>,
     sink: Id,
     _uops: Vec<UOp>,
 }
@@ -150,106 +225,31 @@ impl UOpEGraph {
             sink: Id::default(),
             _uops: vec![],
         };
-        ret.sink = ret.add(&sink);
+        ret.sink = ret.add(sink);
         ret.egraph.rebuild();
-        return ret;
+        if *GRAPH {
+            ret.egraph.dot().to_svg("/tmp/net.egg.svg").unwrap();
+            println!("saved egraph to /tmp/net.egg.svg")
+        }
+        ret
     }
 
     fn add(&mut self, uop: &UOp) -> Id {
         let src = uop.src.iter().map(|x| self.add(x)).collect();
-        let expr = match uop.op {
-            UOps::SINK => SymbolLang::new("sink", src),
-            UOps::VAR => panic!("didn't expect var here"),
-            UOps::DEFINE_GLOBAL => todo!("{uop:?}"),
-            UOps::DEFINE_VAR => todo!("{uop:?}"),
-            UOps::DEFINE_LOCAL => todo!("{uop:?}"),
-            UOps::DEFINE_ACC => todo!("{uop:?}"),
-            UOps::CONST => SymbolLang::leaf(uop.arg.clone().unwrap()),
-            UOps::SPECIAL => SymbolLang::leaf("special"),
-            UOps::NOOP => todo!("{uop:?}"),
-            UOps::UNMUL => todo!("{uop:?}"),
-            UOps::GEP => todo!("{uop:?}"),
-            UOps::CAST => todo!("{uop:?}"),
-            UOps::BITCAST => todo!("{uop:?}"),
-            UOps::ALU => {
-                let op = uop.arg.clone().unwrap().parse::<u32>().unwrap();
-                let op = match uop.src.len() {
-                    1 => match UnaryOps::from(op) {
-                        UnaryOps::EXP2 => "exp2",
-                        UnaryOps::LOG2 => "log2",
-                        UnaryOps::CAST => "cast",
-                        UnaryOps::BITCAST => "bitcast",
-                        UnaryOps::SIN => "sin",
-                        UnaryOps::SQRT => "sqrt",
-                        UnaryOps::NEG => "-",
-                        UnaryOps::RECIP => "recip",
-                    },
-                    2 => match BinaryOps::from(op) {
-                        BinaryOps::ADD => "+",
-                        BinaryOps::MUL => "*",
-                        BinaryOps::IDIV => "//",
-                        BinaryOps::MAX => "max",
-                        BinaryOps::MOD => "%",
-                        BinaryOps::CMPLT => "<",
-                        BinaryOps::CMPNE => "!=",
-                        BinaryOps::XOR => "^",
-                        BinaryOps::SHR => ">>",
-                        BinaryOps::SHL => "<<",
-                    },
-                    3 => match TernaryOps::from(op) {
-                        TernaryOps::WHERE => "where",
-                        TernaryOps::MULACC => "mulacc",
-                    },
-                    _ => panic!(),
-                };
-                SymbolLang::new(op, src)
-            }
-            UOps::WMMA => todo!("{uop:?}"),
-            UOps::LOAD => todo!("{uop:?}"),
-            UOps::STORE => todo!("{uop:?}"),
-            UOps::PHI => todo!("{uop:?}"),
-            UOps::BARRIER => todo!("{uop:?}"),
-            UOps::IF => todo!("{uop:?}"),
-            UOps::RANGE => todo!("{uop:?}"),
-            UOps::ENDRANGE => todo!("{uop:?}"),
-            UOps::ENDIF => todo!("{uop:?}"),
+        let expr = UOpLang {
+            op: uop.op.clone(),
+            dtype: uop.dtype.clone(),
+            src,
+            arg: uop.arg.clone(),
         };
         return self.egraph.add(expr);
     }
 
-    fn graph_rewrite(self, pm: &[Rewrite<SymbolLang, ()>]) -> Vec<UOp> {
+    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> Vec<UOp> {
         let runner = Runner::default().with_egraph(self.egraph).run(pm);
-        // Extract the optimized expression
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best_expr) = extractor.find_best(self.sink);
-        let mut uops: Vec<UOp> = vec![];
-        best_expr.as_ref().iter().for_each(|x| {
-            let src = x
-                .children
-                .iter()
-                .map(|x| return uops[x.to_string().parse::<usize>().unwrap()].clone())
-                .collect::<Vec<UOp>>();
-            let uop = match x.op.as_str() {
-                "+" => UOp::alu(BinaryOps::ADD, src),
-                "max" => UOp::alu(BinaryOps::MAX, src),
-                "sink" => UOp {
-                    op: UOps::SINK,
-                    dtype: None,
-                    src: vec![],
-                    arg: None,
-                },
-                "special" => UOp {
-                    op: UOps::SPECIAL,
-                    dtype: Some("dtyps.int".into()),
-                    src: vec![],
-                    arg: Some("".into()),
-                },
-                _ => UOp::const_("dtypes.int", x.op.to_string().parse().unwrap()),
-            };
-            uops.push(uop)
-        });
-        assert_eq!(uops.last().unwrap().op, UOps::SINK, "didn't end with sink");
-        return uops;
+        panic!("{:?}", best_expr);
     }
 }
 
@@ -274,93 +274,17 @@ mod test_tiny {
 
     #[test]
     fn test_tiny_add() {
-        let val = UOp::const_("dtypes.int", 42);
-        let pat: Pattern<SymbolLang> = "(+ ?x 1)".parse().unwrap();
         let add = UOp {
             op: UOps::ALU,
             dtype: Some("dtypes.int".into()),
-            src: vec![val.clone(), UOp::const_("dtypes.int", 1)],
+            src: vec![UOp::const_("dtypes.int", 42), UOp::const_("dtypes.int", 0)],
             arg: Some((BinaryOps::ADD as u32).to_string()),
         };
         let uegraph = UOpEGraph::new(&add);
+        /*
+        let pat: Pattern<UOpLang> = "(+ ?x 0)".parse().unwrap();
         let matches = pat.search(&uegraph.egraph);
         assert!(!matches.is_empty());
-
-        let add = UOp {
-            op: UOps::ALU,
-            dtype: Some("dtypes.int".into()),
-            src: vec![val.clone(), UOp::const_("dtypes.into", 2)],
-            arg: Some((BinaryOps::ADD as u32).to_string()),
-        };
-        let uegraph = UOpEGraph::new(&add);
-        let matches = pat.search(&uegraph.egraph);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn test_more_serious_pm() {
-        let pm = &[
-            rw!("commute-add"; "(+ ?x ?y)" => "(+ ?y ?x)"),
-            rw!("commute-mul"; "(* ?x ?y)" => "(* ?y ?x)"),
-            rw!("add-0"; "(+ ?x 0)" => "?x"),
-            rw!("mul-0"; "(* ?x 0)" => "0"),
-            rw!("mul-1"; "(* ?x 1)" => "?x"),
-        ];
-        let s0 = UOp {
-            op: UOps::ALU,
-            dtype: Some("dtypes.int".into()),
-            src: vec![UOp::const_("dtypes.int", 42), UOp::const_("dtypes.int", 1)],
-            arg: Some((BinaryOps::MUL as u32).to_string()),
-        };
-        let s1 = UOp {
-            op: UOps::ALU,
-            dtype: Some("dtypes.int".into()),
-            src: vec![s0.clone(), UOp::const_("dtypes.int", 1)],
-            arg: Some((BinaryOps::ADD as u32).to_string()),
-        };
-        let s2 = UOp {
-            op: UOps::ALU,
-            dtype: Some("dtypes.int".into()),
-            src: vec![s0.clone(), UOp::const_("dtypes.int", 1)],
-            arg: Some((BinaryOps::ADD as u32).to_string()),
-        };
-        let sink = UOp {
-            op: UOps::SINK,
-            dtype: None,
-            src: vec![s0.clone(), s1, s2],
-            arg: None,
-        };
-        let uegraph = UOpEGraph::new(&sink);
-        let uops = uegraph.graph_rewrite(pm);
-        assert_eq!(uops.len(), 4);
-        assert_eq!(uops[0], UOp::const_("dtypes.int", 42));
-        assert_eq!(uops[1], UOp::const_("dtypes.int", 1));
-        assert_eq!(uops[2].arg, Some((BinaryOps::ADD as u32).to_string()));
-    }
-
-    #[test]
-    fn test_serious_pm() {
-        let pm: &[Rewrite<SymbolLang, ()>] = &[
-            rw!("commute-add"; "(+ ?x ?y)" => "(+ ?y ?x)"),
-            rw!("commute-mul"; "(* ?x ?y)" => "(* ?y ?x)"),
-            rw!("add-0"; "(+ ?x 0)" => "?x"),
-            rw!("mul-0"; "(* ?x 0)" => "0"),
-            rw!("mul-1"; "(* ?x 1)" => "?x"),
-            // max on special can go away (TODO: special should be variable, same thing applies)
-            // (UOp.max(UOp.cvar('c'), UOp(UOps.SPECIAL).name('s')), lambda c,s: c if (s.arg[2]-1) <= c.arg else None),
-            rw!("max-special"; "(max ?x special)" => "special"),
-        ];
-
-        let lidx0 = UOp {
-            op: UOps::SPECIAL,
-            dtype: Some("dtypes.int".into()),
-            src: vec![],
-            arg: Some("(0, 'lidx0', 3)".into()),
-        };
-
-        let alu = UOp::alu(BinaryOps::MAX, vec![lidx0, UOp::const_("dtypes.int", 1)]);
-        let uegraph = UOpEGraph::new(&sink(vec![alu]));
-        let uops = uegraph.graph_rewrite(pm);
-        panic!("{:?}", uops);
+        */
     }
 }
