@@ -88,7 +88,6 @@ struct UOp {
     src: Vec<UOp>,
     arg: Option<String>,
 }
-
 impl UOp {
     fn alu<T: Into<u32>, D: ToString>(op: T, src: Vec<UOp>) -> UOp {
         let op: u32 = op.into();
@@ -98,20 +97,6 @@ impl UOp {
             src,
             arg: Some(op.to_string()),
         };
-    }
-}
-
-impl<T> From<T> for UOp
-where
-    T: num::Num + ToString,
-{
-    fn from(value: T) -> Self {
-        UOp {
-            op: UOps::CONST,
-            dtype: Some("dtypes.int".into()),
-            src: vec![],
-            arg: Some(value.to_string()),
-        }
     }
 }
 
@@ -139,7 +124,10 @@ impl Display for UOpLang {
 
 impl Language for UOpLang {
     fn matches(&self, other: &Self) -> bool {
-        self.op == other.op && self.len() == other.len() && self.arg == other.arg
+        self.op == other.op
+            && self.len() == other.len()
+            && self.arg == other.arg
+            && self.dtype == other.dtype
     }
 
     fn children(&self) -> &[Id] {
@@ -155,10 +143,11 @@ impl FromOp for UOpLang {
     type Error = Infallible;
 
     fn from_op(op: &str, children: Vec<Id>) -> Result<Self, Self::Error> {
+        let hack = "dtypes.int";
         if let Some(const_literal) = op.parse::<u32>().ok() {
             return Ok(Self {
                 op: UOps::CONST,
-                dtype: Some("dtypes.int".to_string()),
+                dtype: Some(hack.to_string()),
                 src: vec![],
                 arg: Some(const_literal.to_string()),
             });
@@ -167,21 +156,15 @@ impl FromOp for UOpLang {
         let expr = match op {
             "+" => Self {
                 op: UOps::ALU,
-                dtype: Some("dtypes.int".to_string()),
+                dtype: Some(hack.to_string()),
                 src: children,
                 arg: Some((BinaryOps::ADD as u32).to_string()),
             },
             "*" => Self {
                 op: UOps::ALU,
-                dtype: Some("dtypes.int".to_string()),
+                dtype: Some(hack.to_string()),
                 src: children,
                 arg: Some((BinaryOps::MUL as u32).to_string()),
-            },
-            "load" => Self {
-                op: UOps::LOAD,
-                dtype: Some("dtypes.int".to_string()),
-                src: children,
-                arg: None,
             },
             _ => todo!("{op}"),
         };
@@ -300,6 +283,27 @@ mod test_tiny {
         }
     }
 
+    impl From<i32> for UOp {
+        fn from(value: i32) -> Self {
+            UOp {
+                op: UOps::CONST,
+                dtype: Some("dtypes.int".into()),
+                src: vec![],
+                arg: Some(value.to_string()),
+            }
+        }
+    }
+    impl From<f32> for UOp {
+        fn from(value: f32) -> Self {
+            UOp {
+                op: UOps::CONST,
+                dtype: Some("dtypes.float".into()),
+                src: vec![],
+                arg: Some(value.to_string()),
+            }
+        }
+    }
+
     #[test]
     fn test_uop_eq() {
         let u0: UOp = 0.into();
@@ -313,6 +317,20 @@ mod test_tiny {
             op: UOps::ALU,
             dtype: Some("dtypes.int".into()),
             src: vec![42.into(), 1.into()],
+            arg: Some((BinaryOps::ADD as u32).to_string()),
+        };
+        let uegraph = UOpEGraph::new(&add);
+        let pat: Pattern<UOpLang> = "(+ ?x 1)".parse().unwrap();
+        let matches = pat.search(&uegraph.egraph);
+        assert!(!matches.is_empty());
+    }
+
+    #[test]
+    fn test_tiny_add_float() {
+        let add = UOp {
+            op: UOps::ALU,
+            dtype: Some("dtypes.float".into()),
+            src: vec![(42.0).into(), (1.0).into()],
             arg: Some((BinaryOps::ADD as u32).to_string()),
         };
         let uegraph = UOpEGraph::new(&add);
