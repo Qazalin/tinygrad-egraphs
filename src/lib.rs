@@ -89,17 +89,6 @@ struct UOp {
     src: Vec<UOp>,
     arg: Option<String>,
 }
-impl UOp {
-    fn alu<T: Into<u32>, D: ToString>(op: T, src: Vec<UOp>) -> UOp {
-        let op: u32 = op.into();
-        return UOp {
-            op: UOps::ALU,
-            dtype: Some(src.last().unwrap().dtype.clone().unwrap()),
-            src,
-            arg: Some(op.to_string()),
-        };
-    }
-}
 
 fn parse_value(dtype: &str, val_str: &str) -> Result<Box<dyn Any>, String> {
     fn parse<T: 'static + std::str::FromStr>(val_str: &str) -> Result<Box<dyn Any>, String>
@@ -289,9 +278,9 @@ fn pattern_matcher() -> Vec<Rewrite<UOpLang, ()>> {
     INTEGERS.iter().chain(FLOATS.iter()).for_each(|dt| {
         rules.extend([
             // Communative properties https://github.com/jafioti/luminal/blob/8d36e703d70082cddd9a627bef7533036c60ab25/src/shape/symbolic.rs#L903C1-L909C62
-            rwd!(dt, "commute-add"; "({dt}.+ ?a ?b)" => "({dt}.+ ?b ?a)"),
-            rwd!(dt, "commute-mul"; "({dt}.* ?a ?b)" => "({dt}.* ?b ?a)"),
-            rwd!(dt, "commute-max"; "({dt}.max ?a ?b)" => "({dt}.max ?b ?a)"),
+            rwd!(dt, "{dt}.commute-add"; "({dt}.+ ?a ?b)" => "({dt}.+ ?b ?a)"),
+            rwd!(dt, "{dt}.commute-mul"; "({dt}.* ?a ?b)" => "({dt}.* ?b ?a)"),
+            rwd!(dt, "{dt}.commute-max"; "({dt}.max ?a ?b)" => "({dt}.max ?b ?a)"),
             // ** self folding **
             rwd!(dt, "{dt}.add-0"; "({dt}.+ ?x {dt}.0)" => "?x"),
             // TODO: x - 0
@@ -420,18 +409,6 @@ mod test_tiny {
     }
 
     #[test]
-    fn test_symbol_lang_ref() {
-        let mut egraph: EGraph<SymbolLang, ()> = Default::default();
-        let a = egraph.add(SymbolLang::leaf("42"));
-        let b = egraph.add(SymbolLang::leaf("1"));
-        egraph.add(SymbolLang::new("*", vec![a, b]));
-        egraph.rebuild();
-        let pat: Pattern<SymbolLang> = "(* ?x 1)".parse().unwrap();
-        let matches = pat.search(&egraph);
-        assert!(!matches.is_empty());
-    }
-
-    #[test]
     fn test_tiny_mul() {
         let mul_1 = UOp {
             op: UOps::ALU,
@@ -460,18 +437,55 @@ mod test_tiny {
 
     #[test]
     fn test_symbol_lang_ref_mul() {
-        let mut egraph: EGraph<SymbolLang, ()> = Default::default();
+        type EGraph = egg::EGraph<SymbolLang, ()>;
+        #[derive(Debug)]
+        struct ConstFolderApplier {
+            x: &'static str,
+            y: &'static str,
+        }
+        impl Applier<SymbolLang, ()> for ConstFolderApplier {
+            fn apply_one(
+                &self,
+                egraph: &mut EGraph,
+                _: Id,
+                subst: &Subst,
+                _: Option<&PatternAst<SymbolLang>>,
+                _: Symbol,
+            ) -> Vec<Id> {
+                let x_nodes = &egraph[subst[self.x.parse().unwrap()]].nodes;
+                let y_nodes = &egraph[subst[self.y.parse().unwrap()]].nodes;
+                assert_eq!(x_nodes.len(), 1);
+                assert_eq!(y_nodes.len(), 1);
+                let ret = x_nodes[0].op.as_str().parse::<i32>().unwrap()
+                    * y_nodes[0].op.as_str().parse::<i32>().unwrap();
+                let new_id = egraph.add(SymbolLang::leaf(ret.to_string()));
+                return vec![new_id];
+            }
+        }
+        let mut egraph: EGraph = Default::default();
         let a = egraph.add(SymbolLang::leaf("42"));
-        let b = egraph.add(SymbolLang::leaf("1"));
+        let b = egraph.add(SymbolLang::leaf("2"));
         let foo = egraph.add(SymbolLang::new("*", vec![a, b]));
         egraph.rebuild();
         let pm = &[
-            rw!("mul-1"; "(int.* ?x int.1)" => "?x"),
-            rw!("mul-0"; "(int.* ?x int.0)" => "int.0"),
+            rw!("mul-1"; "(* ?x 1)" => "?x"),
+            rw!("mul-const"; "(* ?x ?y)" => { ConstFolderApplier { x: "?x", y: "?y" } }),
         ];
         let runner = Runner::default().with_egraph(egraph).run(pm);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best_expr) = extractor.find_best(foo);
-        println!("{:?}", best_expr);
+        panic!("{:?}", best_expr);
+    }
+
+    #[test]
+    fn test_symbol_lang_ref() {
+        let mut egraph: EGraph<SymbolLang, ()> = Default::default();
+        let a = egraph.add(SymbolLang::leaf("42"));
+        let b = egraph.add(SymbolLang::leaf("1"));
+        egraph.add(SymbolLang::new("*", vec![a, b]));
+        egraph.rebuild();
+        let pat: Pattern<SymbolLang> = "(* ?x 1)".parse().unwrap();
+        let matches = pat.search(&egraph);
+        assert!(!matches.is_empty());
     }
 }
