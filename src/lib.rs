@@ -1,9 +1,10 @@
 use egg::{rewrite as rw, *};
+use half::{bf16, f16};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_pickle as pickle;
 use std::os::raw::{c_char, c_int, c_uchar};
-use std::{convert::Infallible, env, fmt::Display, slice};
+use std::{any::Any, convert::Infallible, env, fmt::Display, slice};
 
 lazy_static::lazy_static! {
     pub static ref GRAPH: bool = env::var("GRAPH").map(|v| v == "1").unwrap_or(false);
@@ -100,6 +101,35 @@ impl UOp {
     }
 }
 
+fn parse_value(dtype: &str, val_str: &str) -> Result<Box<dyn Any>, String> {
+    fn parse<T: 'static + std::str::FromStr>(val_str: &str) -> Result<Box<dyn Any>, String>
+    where
+        T::Err: ToString,
+    {
+        val_str
+            .parse::<T>()
+            .map(|v| Box::new(v) as Box<dyn Any>)
+            .map_err(|e| e.to_string())
+    }
+
+    match dtype {
+        "bool" => parse::<bool>(val_str),
+        "char" => parse::<i8>(val_str),
+        "unsigned_char" => parse::<u8>(val_str),
+        "short" => parse::<i16>(val_str),
+        "unsigned_short" => parse::<u16>(val_str),
+        "int" => parse::<i32>(val_str),
+        "unsigned_int" => parse::<u32>(val_str),
+        "long" => parse::<i64>(val_str),
+        "unsigned_long" => parse::<u64>(val_str),
+        "half" => parse::<f16>(val_str),
+        "__bf16" => parse::<bf16>(val_str),
+        "float" => parse::<f32>(val_str),
+        "double" => parse::<f64>(val_str),
+        _ => panic!("{dtype}"),
+    }
+}
+
 // *** egraph
 #[derive(Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 struct UOpLang {
@@ -143,32 +173,30 @@ impl FromOp for UOpLang {
     type Error = Infallible;
 
     fn from_op(op: &str, children: Vec<Id>) -> Result<Self, Self::Error> {
-        let hack = "dtypes.int";
-        if let Some(const_literal) = op.parse::<u32>().ok() {
+        // https://github.com/bytecodealliance/wasm-tools/blob/1cf71f9a9bbb4706e1e5d21ad2a12586a3911199/crates/wasm-mutate/src/mutators/peephole/rules.rs#L52
+        // TODO: bool alus shouldn't have dtype
+        let splits: Vec<&str> = op.split(".").collect();
+        let dtype = splits[0];
+        if let Some(_) = parse_value(dtype, splits[1]).ok() {
             return Ok(Self {
                 op: UOps::CONST,
-                dtype: Some(hack.to_string()),
+                dtype: Some(format!("dtypes.{dtype}")),
                 src: vec![],
-                arg: Some(const_literal.to_string()),
+                arg: Some(splits[1].to_string()),
             });
         }
-
-        let expr = match op {
-            "+" => Self {
-                op: UOps::ALU,
-                dtype: Some(hack.to_string()),
-                src: children,
-                arg: Some((BinaryOps::ADD as u32).to_string()),
-            },
-            "*" => Self {
-                op: UOps::ALU,
-                dtype: Some(hack.to_string()),
-                src: children,
-                arg: Some((BinaryOps::MUL as u32).to_string()),
-            },
+        let operator = match splits[1] {
+            "+" => BinaryOps::ADD,
+            "*" => BinaryOps::MUL,
+            "max" => BinaryOps::MUL,
             _ => todo!("{op}"),
         };
-        Ok(expr)
+        Ok(Self {
+            op: UOps::ALU,
+            dtype: Some(format!("dtypes.{dtype}")),
+            src: children,
+            arg: Some((operator as u32).to_string()),
+        })
     }
 }
 
@@ -231,6 +259,55 @@ impl UOpEGraph {
     }
 }
 
+fn pattern_matcher() -> Vec<Rewrite<UOpLang, ()>> {
+    let mut rules = vec![
+        // Communative properties https://github.com/jafioti/luminal/blob/8d36e703d70082cddd9a627bef7533036c60ab25/src/shape/symbolic.rs#L903C1-L909C62
+        /*
+        rewrite!("commute-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
+        rewrite!("commute-mul"; "(* ?a ?b)" => "(* ?b ?a)"),
+        rewrite!("commute-max"; "(max ?a ?b)" => "(max ?b ?a)"),
+        */
+    ];
+
+    /*
+     *
+        // ** constant folding **
+        // (UPat(UOps.ALU, name="root", src=UPat(UOps.CONST)), lambda root: UOp.const(root.dtype, exec_alu(root.arg, root.dtype, [x.arg for x in root.src]))),
+        // ** self folding **
+        rw!("mul-1"; "(* ?x 1)" => "?x"),
+        rw!("mul-0"; "(* ?x 0)" => "0"),
+        rw!("const-alu-0"; "(+ ?x ?y)" => "0"),
+    */
+
+    let integers = [
+        "char",
+        "unsigned_char",
+        "short",
+        "unsigned_short",
+        "int",
+        "unsigned_int",
+        "long",
+        "unsigned_long",
+    ];
+    let floats = ["half", "__bf16", "float", "double"];
+    integers.iter().for_each(|dt| {
+        let name = format!("{dt}.mul-0");
+        let lhs = format!("({dt}.* ?x {dt}.1)").parse::<Pattern<_>>().unwrap();
+        let rhs = format!("{dt}.0").parse::<Pattern<_>>().unwrap();
+        let rule = rw!(name; lhs => rhs);
+        rules.push(rule)
+    });
+    floats.iter().for_each(|dt| {
+        let name = format!("{dt}.mul-0");
+        let lhs = format!("({dt}.* ?x {dt}.0)").parse::<Pattern<_>>().unwrap();
+        let rhs = format!("{dt}.0").parse::<Pattern<_>>().unwrap();
+        let rule = rw!(name; lhs => rhs);
+        println!("{:?}", rule);
+        rules.push(rule);
+    });
+    rules
+}
+
 // *** api
 #[repr(C)]
 pub struct ByteArray {
@@ -243,19 +320,13 @@ pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
     let bytes = unsafe { slice::from_raw_parts(data, len as usize) };
     let uop = pickle::from_slice::<UOp>(bytes, serde_pickle::DeOptions::new());
 
-    let constant_folder = &[
-        rw!("mul-1"; "(* ?x 1)" => "?x"),
-        rw!("mul-0"; "(* ?x 0)" => "0"),
-        rw!("const-alu-0"; "(+ ?x ?y)" => "0"),
-    ];
-
     match uop {
         Ok(uop) => {
             if *DEBUG {
                 println!("{:?}", uop);
             }
             let uegraph = UOpEGraph::new(&uop);
-            let uops = uegraph.uops(constant_folder);
+            let uops = uegraph.uops(&pattern_matcher());
             let ret = serde_pickle::to_vec(&uops, serde_pickle::SerOptions::new()).unwrap();
             let len = ret.len();
             let ptr = ret.as_ptr() as *mut c_char;
@@ -320,23 +391,23 @@ mod test_tiny {
             arg: Some((BinaryOps::ADD as u32).to_string()),
         };
         let uegraph = UOpEGraph::new(&add);
-        let pat: Pattern<UOpLang> = "(+ ?x 1)".parse().unwrap();
+        let pat: Pattern<UOpLang> = "(int.+ ?x int.1)".parse().unwrap();
         let matches = pat.search(&uegraph.egraph);
         assert!(!matches.is_empty());
     }
 
     #[test]
-    fn test_tiny_add_float() {
-        let add = UOp {
+    fn test_tiny_mul_float() {
+        let s = UOp {
             op: UOps::ALU,
             dtype: Some("dtypes.float".into()),
-            src: vec![(42.0).into(), (1.0).into()],
-            arg: Some((BinaryOps::ADD as u32).to_string()),
+            src: vec![(42.0).into(), (0.0).into()],
+            arg: Some((BinaryOps::MUL as u32).to_string()),
         };
-        let uegraph = UOpEGraph::new(&add);
-        let pat: Pattern<UOpLang> = "(+ ?x 1)".parse().unwrap();
-        let matches = pat.search(&uegraph.egraph);
-        assert!(!matches.is_empty());
+        let uegraph = UOpEGraph::new(&s);
+        let uops = uegraph.uops(&pattern_matcher());
+        assert_eq!(uops.len(), 1);
+        assert_eq!(uops[0], (0.0).into());
     }
 
     #[test]
@@ -366,8 +437,8 @@ mod test_tiny {
             arg: Some((BinaryOps::MUL as u32).to_string()),
         };
         let pm = &[
-            rw!("mul-1"; "(* ?x 1)" => "?x"),
-            rw!("mul-0"; "(* ?x 0)" => "0"),
+            rw!("mul-1"; "(int.* ?x int.1)" => "?x"),
+            rw!("mul-0"; "(int.* ?x int.0)" => "int.0"),
         ];
         let uegraph = UOpEGraph::new(&sink(&[mul_1, mul_0]));
         let uops = uegraph.uops(pm);
@@ -386,8 +457,8 @@ mod test_tiny {
         let foo = egraph.add(SymbolLang::new("*", vec![a, b]));
         egraph.rebuild();
         let pm = &[
-            rw!("mul-1"; "(* ?x 1)" => "?x"),
-            rw!("mul-0"; "(* ?x 0)" => "0"),
+            rw!("mul-1"; "(int.* ?x int.1)" => "?x"),
+            rw!("mul-0"; "(int.* ?x int.0)" => "int.0"),
         ];
         let runner = Runner::default().with_egraph(egraph).run(pm);
         let extractor = Extractor::new(&runner.egraph, AstSize);

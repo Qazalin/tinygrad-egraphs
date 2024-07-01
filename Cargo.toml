@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 egg = { version = "0.9.5" }
+half = "2.4.1"
 lazy_static = "1.5.0"
 num = "0.4.3"
 num_enum = "0.7.2"
