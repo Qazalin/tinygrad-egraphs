@@ -139,7 +139,7 @@ impl Display for UOpLang {
 
 impl Language for UOpLang {
     fn matches(&self, other: &Self) -> bool {
-        self.op == other.op && self.len() == other.len()
+        self.op == other.op && self.len() == other.len() && self.arg == other.arg
     }
 
     fn children(&self) -> &[Id] {
@@ -254,22 +254,33 @@ impl UOpEGraph {
         return self.egraph.add(expr);
     }
 
-    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> RecExpr<UOpLang> {
+    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> Vec<UOp> {
         let runner = Runner::default().with_egraph(self.egraph).run(pm);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best_expr) = extractor.find_best(self.sink);
-        best_expr
+        let mut uops: Vec<UOp> = vec![];
+        best_expr.as_ref().iter().for_each(|ul| {
+            let src: Vec<&UOp> = ul.src.iter().map(|x| &uops[usize::from(*x)]).collect();
+            uops.push(UOp {
+                op: ul.op.clone(),
+                dtype: ul.dtype.clone(),
+                src: src.iter().map(|x| (**x).clone()).collect(),
+                arg: ul.arg.clone(),
+            })
+        });
+        assert_eq!(uops.last().unwrap().op, UOps::SINK, "didn't end with sink");
+        uops
     }
 }
 
 #[cfg(test)]
 mod test_tiny {
     use super::*;
-    fn sink(src: Vec<UOp>) -> UOp {
+    fn sink(src: &[UOp]) -> UOp {
         UOp {
             op: UOps::SINK,
             dtype: None,
-            src,
+            src: src.to_vec(),
             arg: None,
         }
     }
@@ -309,19 +320,29 @@ mod test_tiny {
 
     #[test]
     fn test_tiny_mul() {
-        let add = UOp {
+        let mul_1 = UOp {
             op: UOps::ALU,
             dtype: Some("dtypes.int".into()),
             src: vec![42.into(), 1.into()],
+            arg: Some((BinaryOps::MUL as u32).to_string()),
+        };
+        let mul_0 = UOp {
+            op: UOps::ALU,
+            dtype: Some("dtypes.int".into()),
+            src: vec![69.into(), 0.into()],
             arg: Some((BinaryOps::MUL as u32).to_string()),
         };
         let pm = &[
             rw!("mul-1"; "(* ?x 1)" => "?x"),
             rw!("mul-0"; "(* ?x 0)" => "0"),
         ];
-        let uegraph = UOpEGraph::new(&add);
-        let sink = uegraph.graph_rewrite(pm);
-        panic!("{:?}", sink);
+        let uegraph = UOpEGraph::new(&sink(&[mul_1, mul_0]));
+        let uops = uegraph.graph_rewrite(pm);
+        assert_eq!(uops.len(), 3);
+        let sinked = &uops.last().unwrap().src;
+        assert_eq!(sinked.len(), 2);
+        assert_eq!(sinked[0], 42.into());
+        assert_eq!(sinked[1], 0.into());
     }
 
     #[test]
@@ -338,6 +359,6 @@ mod test_tiny {
         let runner = Runner::default().with_egraph(egraph).run(pm);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best_expr) = extractor.find_best(foo);
-        panic!("{:?}", best_expr);
+        println!("{:?}", best_expr);
     }
 }
