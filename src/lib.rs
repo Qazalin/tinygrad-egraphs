@@ -129,6 +129,17 @@ fn parse_value(dtype: &str, val_str: &str) -> Result<Box<dyn Any>, String> {
         _ => panic!("{dtype}"),
     }
 }
+static INTEGERS: &[&str] = &[
+    "char",
+    "unsigned_char",
+    "short",
+    "unsigned_short",
+    "int",
+    "unsigned_int",
+    "long",
+    "unsigned_long",
+];
+static FLOATS: &[&str] = &["half", "__bf16", "float", "double"];
 
 // *** egraph
 #[derive(Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
@@ -186,16 +197,18 @@ impl FromOp for UOpLang {
             });
         }
         let operator = match splits[1] {
-            "+" => BinaryOps::ADD,
-            "*" => BinaryOps::MUL,
-            "max" => BinaryOps::MUL,
+            "+" => BinaryOps::ADD as u32,
+            "*" => BinaryOps::MUL as u32,
+            "//" => BinaryOps::IDIV as u32,
+            "-" => UnaryOps::NEG as u32,
+            "max" => BinaryOps::MUL as u32,
             _ => todo!("{op}"),
         };
         Ok(Self {
             op: UOps::ALU,
             dtype: Some(format!("dtypes.{dtype}")),
             src: children,
-            arg: Some((operator as u32).to_string()),
+            arg: Some(operator.to_string()),
         })
     }
 }
@@ -259,52 +272,48 @@ impl UOpEGraph {
     }
 }
 
+macro_rules! rwd {
+    (
+        $dt:expr,
+        $name:expr;
+        $lhs:tt => $rhs:tt
+        $(if $cond:expr)*
+    ) => {{
+        let lhs = $lhs.replace("{dt}", $dt).parse::<Pattern<_>>().unwrap();
+        let rhs = $rhs.replace("{dt}", $dt).parse::<Pattern<_>>().unwrap();
+        rw!($name.replace("{dt}", $dt); lhs => rhs)
+    }};
+}
 fn pattern_matcher() -> Vec<Rewrite<UOpLang, ()>> {
-    let mut rules = vec![
-        // Communative properties https://github.com/jafioti/luminal/blob/8d36e703d70082cddd9a627bef7533036c60ab25/src/shape/symbolic.rs#L903C1-L909C62
-        /*
-        rewrite!("commute-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
-        rewrite!("commute-mul"; "(* ?a ?b)" => "(* ?b ?a)"),
-        rewrite!("commute-max"; "(max ?a ?b)" => "(max ?b ?a)"),
-        */
-    ];
-
-    /*
-     *
-        // ** constant folding **
-        // (UPat(UOps.ALU, name="root", src=UPat(UOps.CONST)), lambda root: UOp.const(root.dtype, exec_alu(root.arg, root.dtype, [x.arg for x in root.src]))),
-        // ** self folding **
-        rw!("mul-1"; "(* ?x 1)" => "?x"),
-        rw!("mul-0"; "(* ?x 0)" => "0"),
-        rw!("const-alu-0"; "(+ ?x ?y)" => "0"),
-    */
-
-    let integers = [
-        "char",
-        "unsigned_char",
-        "short",
-        "unsigned_short",
-        "int",
-        "unsigned_int",
-        "long",
-        "unsigned_long",
-    ];
-    let floats = ["half", "__bf16", "float", "double"];
-    integers.iter().for_each(|dt| {
-        let name = format!("{dt}.mul-0");
-        let lhs = format!("({dt}.* ?x {dt}.1)").parse::<Pattern<_>>().unwrap();
-        let rhs = format!("{dt}.0").parse::<Pattern<_>>().unwrap();
-        let rule = rw!(name; lhs => rhs);
-        rules.push(rule)
+    let mut rules = vec![];
+    INTEGERS.iter().chain(FLOATS.iter()).for_each(|dt| {
+        rules.extend([
+            // Communative properties https://github.com/jafioti/luminal/blob/8d36e703d70082cddd9a627bef7533036c60ab25/src/shape/symbolic.rs#L903C1-L909C62
+            rwd!(dt, "commute-add"; "({dt}.+ ?a ?b)" => "({dt}.+ ?b ?a)"),
+            rwd!(dt, "commute-mul"; "({dt}.* ?a ?b)" => "({dt}.* ?b ?a)"),
+            rwd!(dt, "commute-max"; "({dt}.max ?a ?b)" => "({dt}.max ?b ?a)"),
+            // ** self folding **
+            rwd!(dt, "{dt}.add-0"; "({dt}.+ ?x {dt}.0)" => "?x"),
+            // TODO: x - 0
+            rwd!(dt, "{dt}.mul-0"; "({dt}.* ?x {dt}.0)" => "{dt}.0"),
+            rwd!(dt, "{dt}.mul-1"; "({dt}.* ?x {dt}.1)" => "?x"),
+        ]);
+        rules.extend(match INTEGERS.contains(dt) {
+            true => vec![
+                rwd!(dt, "{dt}.idiv-self"; "({dt}.// ?x ?x)" => "?x"),
+                rwd!(dt, "{dt}.idiv-one"; "({dt}.// ?x {dt}.1)" => "?x"),
+            ],
+            // TODO: (UOp.var('x') / UOp.cvar('c'), lambda x,c: x*exec_alu(UnaryOps.RECIP, c.dtype, [c.arg])),    # x/c -> x*(1/c)
+            false => vec![rwd!(dt, "{dt}.recip-self"; "({dt}.// ?x ?x)" => "?x")],
+        });
+        if !dt.starts_with("unsigned") {
+            rules.push(rwd!(dt, "{dt}.mul-neg"; "({dt}.* ?x {dt}.-1)" => "({dt}.- ?x)"));
+            if INTEGERS.contains(dt) {
+                rules.push(rwd!(dt, "{dt}.idiv-neg"; "({dt}.// ?x {dt}.-1)" => "({dt}.- ?x)"));
+            }
+        }
     });
-    floats.iter().for_each(|dt| {
-        let name = format!("{dt}.mul-0");
-        let lhs = format!("({dt}.* ?x {dt}.0)").parse::<Pattern<_>>().unwrap();
-        let rhs = format!("{dt}.0").parse::<Pattern<_>>().unwrap();
-        let rule = rw!(name; lhs => rhs);
-        println!("{:?}", rule);
-        rules.push(rule);
-    });
+    rules.push(rw!("bool.max"; "(bool.max ?x bool.false)" => "?x"));
     rules
 }
 
