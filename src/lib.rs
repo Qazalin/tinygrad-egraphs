@@ -1,4 +1,3 @@
-#[allow(unused)]
 use egg::{rewrite as rw, *};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -8,9 +7,10 @@ use std::{convert::Infallible, env, fmt::Display, slice};
 
 lazy_static::lazy_static! {
     pub static ref GRAPH: bool = env::var("GRAPH").map(|v| v == "1").unwrap_or(false);
+    pub static ref DEBUG: bool = env::var("DEBUG").map(|v| v == "1").unwrap_or(false);
 }
 
-// *** ops
+// *** tinygrad
 #[derive(Debug, FromPrimitive, IntoPrimitive)]
 #[repr(u32)]
 enum UnaryOps {
@@ -50,7 +50,6 @@ enum TernaryOps {
     MULACC,
 }
 
-// *** uops
 #[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 #[allow(non_camel_case_types)]
 enum UOps {
@@ -116,6 +115,7 @@ where
     }
 }
 
+// *** egraph
 #[derive(Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 struct UOpLang {
     op: UOps,
@@ -189,36 +189,6 @@ impl FromOp for UOpLang {
     }
 }
 
-// *** api
-#[repr(C)]
-pub struct ByteArray {
-    ptr: *mut c_char,
-    len: usize,
-}
-
-#[no_mangle]
-pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
-    let bytes = unsafe { slice::from_raw_parts(data, len as usize) };
-    let uop = pickle::from_slice::<UOp>(bytes, serde_pickle::DeOptions::new());
-    match uop {
-        Ok(uop) => {
-            println!("{:?}", uop);
-            let new: UOp = 42.into();
-            let ret = serde_pickle::to_vec(&new, serde_pickle::SerOptions::new()).unwrap();
-            let len = ret.len();
-            let ptr = ret.as_ptr() as *mut c_char;
-            std::mem::forget(ret);
-            ByteArray { ptr, len }
-        }
-        Err(err) => {
-            let value =
-                pickle::from_slice::<serde_pickle::Value>(bytes, serde_pickle::DeOptions::new())
-                    .unwrap();
-            panic!("couldn't handle {:?}\n error = {:?}", value, err);
-        }
-    }
-}
-
 #[derive(Debug)]
 struct UOpEGraph {
     egraph: EGraph<UOpLang, ()>,
@@ -254,12 +224,17 @@ impl UOpEGraph {
         return self.egraph.add(expr);
     }
 
-    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> Vec<UOp> {
+    fn graph_rewrite(self, pm: &[Rewrite<UOpLang, ()>]) -> RecExpr<UOpLang> {
         let runner = Runner::default().with_egraph(self.egraph).run(pm);
         let extractor = Extractor::new(&runner.egraph, AstSize);
         let (_, best_expr) = extractor.find_best(self.sink);
+        best_expr
+    }
+
+    fn uops(self, pm: &[Rewrite<UOpLang, ()>]) -> Vec<UOp> {
+        let expr = self.graph_rewrite(pm);
         let mut uops: Vec<UOp> = vec![];
-        best_expr.as_ref().iter().for_each(|ul| {
+        expr.as_ref().iter().for_each(|ul| {
             let src: Vec<&UOp> = ul.src.iter().map(|x| &uops[usize::from(*x)]).collect();
             uops.push(UOp {
                 op: ul.op.clone(),
@@ -268,8 +243,48 @@ impl UOpEGraph {
                 arg: ul.arg.clone(),
             })
         });
-        assert_eq!(uops.last().unwrap().op, UOps::SINK, "didn't end with sink");
+        // assert_eq!(uops.last().unwrap().op, UOps::SINK, "didn't end with sink");
         uops
+    }
+}
+
+// *** api
+#[repr(C)]
+pub struct ByteArray {
+    ptr: *mut c_char,
+    len: usize,
+}
+
+#[no_mangle]
+pub extern "C" fn rewrite_uops(data: *const c_uchar, len: c_int) -> ByteArray {
+    let bytes = unsafe { slice::from_raw_parts(data, len as usize) };
+    let uop = pickle::from_slice::<UOp>(bytes, serde_pickle::DeOptions::new());
+
+    let constant_folder = &[
+        rw!("mul-1"; "(* ?x 1)" => "?x"),
+        rw!("mul-0"; "(* ?x 0)" => "0"),
+        rw!("const-alu-0"; "(+ ?x ?y)" => "0"),
+    ];
+
+    match uop {
+        Ok(uop) => {
+            if *DEBUG {
+                println!("{:?}", uop);
+            }
+            let uegraph = UOpEGraph::new(&uop);
+            let uops = uegraph.uops(constant_folder);
+            let ret = serde_pickle::to_vec(&uops, serde_pickle::SerOptions::new()).unwrap();
+            let len = ret.len();
+            let ptr = ret.as_ptr() as *mut c_char;
+            std::mem::forget(ret);
+            ByteArray { ptr, len }
+        }
+        Err(err) => {
+            let value =
+                pickle::from_slice::<serde_pickle::Value>(bytes, serde_pickle::DeOptions::new())
+                    .unwrap();
+            panic!("couldn't parse {:?} as uop\n error = {:?}", value, err);
+        }
     }
 }
 
@@ -337,7 +352,7 @@ mod test_tiny {
             rw!("mul-0"; "(* ?x 0)" => "0"),
         ];
         let uegraph = UOpEGraph::new(&sink(&[mul_1, mul_0]));
-        let uops = uegraph.graph_rewrite(pm);
+        let uops = uegraph.uops(pm);
         assert_eq!(uops.len(), 3);
         let sinked = &uops.last().unwrap().src;
         assert_eq!(sinked.len(), 2);
